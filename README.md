@@ -15,7 +15,7 @@ A **thread-safe** automation bot for Clash of Clans farming on LDPlayer emulator
 
 ### Software
 - **Python 3.8+**
-- **LDPlayer emulator** (window title must contain "LDPlayer")
+- **LDPlayer emulator** (window title must contain "LDPlayer", if you use other emulators or anything, just change the name of the window title in the config.py)
 - **NVIDIA GPU** (recommended for YOLO inference; CPU mode supported)
 
 ### Python Dependencies

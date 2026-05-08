@@ -1,0 +1,25 @@
+# Core computer vision and ML
+ultralytics>=8.0.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+easyocr>=1.7.0
+
+# Window automation and control
+pywinauto>=0.9.3
+pyautogui>=0.9.53
+
+# Keyboard input
+keyboard>=0.13.5
+
+# Standard library (included, listed for reference):
+# - tkinter (built-in with Python)
+# - logging (built-in)
+# - os (built-in)
+# - sys (built-in)
+# - threading (built-in)
+# - time (built-in)
+# - queue (built-in)
+
+# Optional: for GPU acceleration (install if you have NVIDIA GPU)
+# torch>=2.0.0  # Uncomment for CUDA support
+# torchvision>=0.15.0  # Uncomment for torch vision utilities

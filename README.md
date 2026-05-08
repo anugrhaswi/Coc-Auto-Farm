@@ -32,8 +32,8 @@ See `requirements.txt` for full list:
 
 ### 1. Clone the Repository
 ```bash
-git clone https://github.com/YOUR_USERNAME/cocbot.git
-cd cocbot
+git clone https://github.com/anugrhaswi/Coc-Auto-Farm.git
+cd Coc-Auto-Farm
 ```
 
 ### 2. Create Virtual Environment
@@ -156,7 +156,7 @@ MIT License — See `LICENSE` file.
 
 ## Author
 
-**Your Name** ([GitHub](https://github.com/YOUR_USERNAME))
+**Anugrha Bhujel** ([GitHub](https://github.com/anugrhaswi))
 
 ---
 

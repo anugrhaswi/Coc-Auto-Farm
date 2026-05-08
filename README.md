@@ -1,6 +1,6 @@
 # COC Auto Farm Bot
 
-A **thread-safe** automation bot for Clash of Clans farming on LDPlayer emulator. Uses YOLO object detection and EasyOCR to automatically search for bases, read resource values, and initiate attacks.
+A **thread-safe** automation bot for Clash of Clans farming on LDPlayer or any compatible Android emulator/runtime. Uses YOLO object detection and EasyOCR to automatically search for bases, read resource values, and initiate attacks.
 
 ## Features
 
@@ -15,7 +15,7 @@ A **thread-safe** automation bot for Clash of Clans farming on LDPlayer emulator
 
 ### Software
 - **Python 3.8+**
-- **LDPlayer emulator** (window title must contain "LDPlayer", if you use other emulators or anything, just change the name of the window title in the config.py)
+- **Android emulator / Android runtime** (configure the window title regex in `config.py`; the default matches LDPlayer but can be changed for any emulator)
 - **NVIDIA GPU** (recommended for YOLO inference; CPU mode supported)
 
 ### Python Dependencies
@@ -83,7 +83,7 @@ Edit `config.py` to adjust:
 |--------|---------|
 | `main.py` | Entry point; wires all components together |
 | `config.py` | Configuration dataclass |
-| `window_manager.py` | `WindowManager`: LDPlayer connection, focus, screenshot capture |
+| `window_manager.py` | `WindowManager`: emulator connection, focus, screenshot capture |
 | `vision.py` | `VisionManager`: YOLO detection, EasyOCR reading |
 | `automation.py` | `AutomationController`: Thin wrapper around pyautogui |
 | `bot.py` | `CocBot`: Farming brain; runs in worker thread, checks `_stop_event` every sleep |

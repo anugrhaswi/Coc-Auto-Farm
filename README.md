@@ -169,4 +169,4 @@ This bot is the result of iterative learning:
 4. **Threading**: Fixed `RuntimeError` by replacing `root.after()` with queue-based messaging
 5. **Architecture**: Modularized globals into focused classes for maintainability and testability
 
-See the original `main.ipynb` in the `backup/` folder for the development history.
+This repository contains the production-ready `Coc-Auto-Farm` code. The original notebook and experimental drafts are not included in the public repo.

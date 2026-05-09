@@ -3,8 +3,7 @@
 A **thread-safe** automation bot for Clash of Clans farming on LDPlayer or any compatible Android emulator/runtime. Uses YOLO object detection and EasyOCR to automatically search for bases, read resource values, and initiate attacks.
 ## Demo Video
 
-🎥 Watch the full demo on YouTube:  
-https://youtu.be/PzhG1cAX54Y
+[![Watch the demo](https://img.youtube.com/vi/PzhG1cAX54Y/maxresdefault.jpg)](https://youtu.be/PzhG1cAX54Y)
 
 ## Features
 

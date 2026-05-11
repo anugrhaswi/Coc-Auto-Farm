@@ -15,9 +15,15 @@ dist/
 build/
 
 # Model files (large, keep locally)
-*.pt
-*.pth
-models/
+# Keep the models/ folder tracked, but ignore model artifacts outside it if needed.
+# *.pt
+# *.pth
+# models/
+
+# Build and packaging
+build/
+dist/
+main.spec
 
 # Logs
 logs/

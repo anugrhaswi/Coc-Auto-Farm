@@ -159,7 +159,7 @@ MIT License — See `LICENSE` file.
 
 ## Author
 
-**Anugrha Bhujel** ([GitHub](https://github.com/anugrhaswi))
+**Anugrha Bhujel** ([GitHub](https://github.com/anugrhaswi), [LinkedIn](https://www.linkedin.com/in/anugrhaswi/))
 
 ---
 

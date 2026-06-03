@@ -1,7 +1,6 @@
 # COC Auto Farm Bot
 
 A **thread-safe** automation bot for Clash of Clans farming on LDPlayer or any compatible Android emulator/runtime. Uses YOLO object detection and EasyOCR to automatically search for bases, read resource values, and initiate attacks.
-## Demo Video
 
 ## Features
 

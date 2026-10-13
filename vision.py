@@ -1,6 +1,53 @@
-from ultralytics import YOLO
-import easyocr
-import numpy as np
+import logging
+
+import cv2
+
+logger = logging.getLogger(__name__)
+
+# Characters EasyOCR is allowed to return when reading a resource value.
+# Letters are included so an abbreviated value like "1.2M" is not silently
+# truncated to "12" by a digits-only allowlist.
+_OCR_ALLOWLIST = "0123456789.,KMBkmb"
+
+_SUFFIX_MULTIPLIERS = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000}
+
+
+def parse_loot_number(text: str) -> str:
+    """
+    Convert raw OCR text for a resource value into a plain integer string.
+
+    Handles thousands separators ("1,234,567", "1.234.567") and abbreviated
+    values ("650K", "1.2M", "3.5B"). Returns "0" when nothing numeric is found.
+
+    Examples:
+        "1,234,567" -> "1234567"
+        "+650K"     -> "650000"
+        "1.2M"      -> "1200000"
+        "Gold"      -> "0"
+    """
+    if not text:
+        return "0"
+
+    cleaned = (
+        text.strip().lower().replace(",", "").replace(" ", "").replace("+", "")
+    )
+    if not cleaned:
+        return "0"
+
+    suffix = cleaned[-1]
+    if suffix in _SUFFIX_MULTIPLIERS:
+        core = cleaned[:-1]
+        try:
+            value = float(core) * _SUFFIX_MULTIPLIERS[suffix]
+        except ValueError:
+            digits = "".join(ch for ch in core if ch.isdigit())
+            value = float(digits or "0") * _SUFFIX_MULTIPLIERS[suffix]
+        return str(int(round(value)))
+
+    # No multiplier: every separator is a thousands separator, so drop all
+    # non-digits ("1.234.567" and "1,234,567" both become "1234567").
+    digits = "".join(ch for ch in cleaned if ch.isdigit())
+    return digits or "0"
 
 
 class VisionManager:
@@ -28,13 +75,17 @@ class VisionManager:
         """
         if self.model is None:
             try:
+                from ultralytics import YOLO
                 self.model = YOLO(self.config.model_path)
             except Exception as e:
                 raise RuntimeError(f"Failed to load YOLO model from '{self.config.model_path}': {e}")
-        
+
         if self.reader is None:
             try:
-                self.reader = easyocr.Reader(['en'], gpu=self.config.gpu)
+                import torch
+                import easyocr
+                use_gpu = torch.cuda.is_available() if self.config.gpu is None else self.config.gpu
+                self.reader = easyocr.Reader(['en'], gpu=use_gpu)
             except Exception as e:
                 raise RuntimeError(f"Failed to load EasyOCR reader: {e}")
     
@@ -97,30 +148,48 @@ class VisionManager:
 
         return detections
 
+    def _preprocess(self, region):
+        """
+        Prepare a small resource-value crop for OCR: upscale short crops so the
+        glyphs are large enough for the recognizer, then convert to grayscale.
+        """
+        h, w = region.shape[:2]
+        if h and h < 64:
+            scale = 64.0 / h
+            region = cv2.resize(
+                region,
+                (max(1, int(w * scale)), 64),
+                interpolation=cv2.INTER_CUBIC,
+            )
+        return cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+
     def read_number(self, frame, bbox):
         """
         OCR a region of the frame to extract a number.
-        
+
         Args:
             frame: np.ndarray, BGR format
             bbox: tuple (x1, y1, x2, y2) - region to OCR
-        
+
         Returns:
-            str: OCR'd text, cleaned (digits only)
+            str: the value as a plain integer string (separators removed,
+            abbreviations expanded), or "0" if nothing readable.
         """
         if self.reader is None:
             self.load()
-        
+
         x1, y1, x2, y2 = bbox
         region = frame[y1:y2, x1:x2]
-        
+
         if region.size == 0:
             return "0"
-        
-        # OCR with digit allowlist
-        ocr_result = self.reader.readtext(region, detail=0, allowlist='0123456789')
-        
-        # Return first result or "0" if empty
-        if ocr_result:
-            return ocr_result[0]
-        return "0"
+
+        ocr_result = self.reader.readtext(
+            self._preprocess(region), detail=0, allowlist=_OCR_ALLOWLIST
+        )
+
+        # EasyOCR can split a value into several fragments; keep them all.
+        raw = " ".join(str(part) for part in ocr_result) if ocr_result else ""
+        value = parse_loot_number(raw)
+        logger.debug(f"OCR bbox={(x1, y1, x2, y2)} raw={raw!r} -> {value}")
+        return value

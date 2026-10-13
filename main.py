@@ -2,6 +2,8 @@
 Entry point: composes all modules and starts the Tkinter GUI.
 """
 
+print("COC Auto-Farm: starting...", flush=True)
+
 import logging
 import os
 import queue
@@ -12,18 +14,22 @@ from tkinter import messagebox
 import keyboard
 
 from config import AppConfig
+from adb import EmulatorAdb
 from logger import setup_logging
 from window_manager import WindowManager
+from settings import load_settings
 from vision import VisionManager
 from automation import AutomationController
 from bot import CocBot
 from gui import BotGUI
+from notify import Notifier
 
 logger = logging.getLogger(__name__)
 
 
 def main():
     setup_logging()
+    logger.info("COC Auto-Farm starting")
 
     config = AppConfig()
 
@@ -32,27 +38,47 @@ def main():
     if os.path.exists(model_full_path):
         config.model_path = model_full_path
 
-    # Connect to LDPlayer window
-    try:
-        window = WindowManager(config)
-    except Exception as e:
-        logger.error(f"Failed to connect to LDPlayer window: {e}")
-        root = tk.Tk()
-        root.withdraw()
+    settings = load_settings()
+    notifier = Notifier(settings.get("notifications"))
+
+    # Root is kept visible from the start so error dialogs (and the GUI) work.
+    root = tk.Tk()
+
+    adb = EmulatorAdb(
+        host=config.adb_host, port=config.adb_port, adb_path=config.adb_path
+    )
+    if not adb.connect():
+        logger.error(f"ADB connect failed: {adb.last_error}")
+        # Process is about to exit, so send synchronously (text only: ADB is down).
+        notifier.notify(
+            "COC Auto-Farm: ADB error",
+            "Could not connect to the emulator via ADB. "
+            f"Details: {adb.last_error}",
+            blocking=True,
+            priority="high",
+            tags="warning",
+        )
         messagebox.showerror(
-            "Connection Error",
-            f"Could not connect to LDPlayer window.\n\n{e}\n\n"
-            "Please start LDPlayer and make sure its title contains 'LDPlayer'."
+            "ADB Error",
+            "Could not connect to the emulator via ADB.\n\n"
+            "Start the emulator and enable 'ADB local connection' in LDPlayer "
+            "settings (Settings > Others).\n"
+            "Expected device: 127.0.0.1:5555 (first instance).\n\n"
+            f"Details: {adb.last_error}",
         )
         sys.exit(1)
 
+    window = WindowManager(adb=adb)
     vision = VisionManager(config)
-    automation = AutomationController()
+    automation = AutomationController(adb=adb)
+    controls = settings.get("controls") or {}
+    waits = settings.get("waits") or {}
+    recovery = settings.get("recovery") or {}
 
     msg_queue = queue.Queue()
-    bot = CocBot(config, window, vision, automation, msg_queue)
+    bot = CocBot(config, window, vision, automation, msg_queue, controls=controls, waits=waits, notifier=notifier, recovery=recovery)
 
-    root = tk.Tk()
+    root.deiconify()
     app = BotGUI(root, bot, msg_queue)
 
     # Emergency keyboard stop

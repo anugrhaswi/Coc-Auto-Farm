@@ -4,9 +4,8 @@ opencv-python>=4.8.0
 numpy>=1.24.0
 easyocr>=1.7.0
 
-# Window automation and control
-pywinauto>=0.9.3
-pyautogui>=0.9.53
+# Calibration screenshot previewer
+Pillow>=10.0.0
 
 # Keyboard input
 keyboard>=0.13.5

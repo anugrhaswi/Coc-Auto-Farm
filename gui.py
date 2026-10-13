@@ -165,7 +165,8 @@ class BotGUI:
                     elif state == "running":
                         self.start_btn.config(state="disabled")
                         self.stop_btn.config(state="normal")
-                        self.root.withdraw()  # hide window while farming, like old notebook
+                        # Keep the window visible so Stop Farm stays clickable.
+                        self.status_var.set("running - press F12 or Stop Farm")
 
                 elif mtype == "alert":
                     messagebox.showinfo("Bot Alert", msg.get("text", ""))

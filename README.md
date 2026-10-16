@@ -54,11 +54,12 @@ Make sure LDPlayer is running and on your main village, then:
 python calibrate.py
 ```
 
-Click the 11 buttons in the order shown, then **Save**. This writes a `controls` section into `settings.json`. Recalibrate after a game update that moves buttons.
+Click the 11 buttons in the order shown, then **Save**. This writes a `controls` section into `settings.json`. Use the **Recapture** button to grab a fresh screenshot whenever you navigate the game to another button's screen (no need to restart the tool). Recalibrate after a game update that moves buttons.
 
 ### 2. Run the bot
 
-Easiest: double-click `run.bat` (activates `.venv` and checks dependencies).
+Easiest: double-click `run.bat` — on first run it creates `.venv` and installs
+dependencies (with a prompt), then launches the GUI.
 Or manually:
 
 ```bash

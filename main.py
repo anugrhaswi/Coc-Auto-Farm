@@ -74,9 +74,10 @@ def main():
     controls = settings.get("controls") or {}
     waits = settings.get("waits") or {}
     recovery = settings.get("recovery") or {}
+    attack = settings.get("attack") or {}
 
     msg_queue = queue.Queue()
-    bot = CocBot(config, window, vision, automation, msg_queue, controls=controls, waits=waits, notifier=notifier, recovery=recovery)
+    bot = CocBot(config, window, vision, automation, msg_queue, controls=controls, waits=waits, notifier=notifier, recovery=recovery, attack=attack)
 
     root.deiconify()
     app = BotGUI(root, bot, msg_queue)

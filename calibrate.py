@@ -8,9 +8,17 @@ coordinates (fractions of the screen), so they survive resolution changes and
 no YOLO retraining is ever needed.
 
 Run this once after installing, and again after a game update that moves buttons.
-To re-fix just ONE button (e.g. a update moved a single spot), click its row in
-the progress list, click the new spot on the screenshot, then press Save — the
-other buttons keep their saved coordinates.
+
+The screenshot is captured when the tool starts, but the game screen changes
+between buttons (village -> search -> battle -> quit dialog). Press **Recapture**
+at any time to grab the current screen again, so you can navigate the emulator
+and re-capture without restarting the script. The row you selected stays selected
+across recaptures, so the workflow is: pick a button's row, navigate the game to
+that screen, press Recapture, then click the spot.
+
+To re-fix just ONE button (e.g. an update moved a single spot), click its row in
+the progress list, (optionally Recapture to change screens), click the new spot on
+the screenshot, then press Save — the other buttons keep their saved coordinates.
 """
 
 # The eleven calibrated controls, in farm-loop press order, with plain-English
@@ -45,6 +53,7 @@ BUTTON_COLORS = [
 ]
 
 import sys
+import time
 import tkinter as tk
 from tkinter import messagebox
 
@@ -138,10 +147,16 @@ class Calibrator:
 
         btn_bar = tk.Frame(root, bg="#202124")
         btn_bar.grid(row=3, column=0, sticky="we", pady=(4, 10))
+        self.status_var = tk.StringVar()
+        tk.Label(
+            btn_bar, textvariable=self.status_var, fg="#9aa0a6", bg="#202124",
+            font=("Segoe UI", 9),
+        ).pack(side="right", padx=10)
         for text, cmd, color in [
             ("Undo", self.undo, "#5f6368"),
             ("Clear selected", self.clear_selected, "#a86418"),
             ("Clear all", self.clear_all, "#8b0000"),
+            ("Recapture", self.recapture, "#1a73e8"),
             ("Save to settings", self.save, "#188038"),
         ]:
             tk.Button(
@@ -203,6 +218,24 @@ class Calibrator:
             )
             sys.exit(1)
         self._img = frame
+
+    def recapture(self):
+        """
+        Grab the current emulator screen again, so the user can navigate the
+        game to another button's screen without restarting the tool. On failure
+        the previous screenshot is kept (the app does not exit); the current
+        row/selection and undo history are left untouched.
+        """
+        frame = self.adb.screencap()
+        if frame is None:
+            messagebox.showerror(
+                "Recapture failed",
+                f"Could not capture the emulator screen.\n{self.adb.last_error}",
+            )
+            return
+        self._img = frame
+        self._render()
+        self.status_var.set("Recaptured " + time.strftime("%H:%M:%S"))
 
     def _on_resize(self, _event):
         if self._render_job is not None:

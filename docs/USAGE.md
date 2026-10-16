@@ -18,7 +18,11 @@ python calibrate.py
 ```
 
 1. The tool connects via ADB and shows a screenshot of your current screen.
-2. Click the button described at the top, in order:
+2. Navigate the game to each button's screen as you go, and press **Recapture**
+   to grab a fresh screenshot of whatever is on the emulator now — the current
+   row/selection is kept, so you don't restart the tool between screens (the
+   status line shows `Recaptured HH:MM:SS`).
+3. Click the button described at the top, in order:
    - **Attack button** (village screen, bottom-right cluster)
    - **Find Match** (green button)
    - **Next base** (on the search screen)
@@ -27,16 +31,18 @@ python calibrate.py
    - **Surrender button** (in battle, bottom-left)
    - **Surrender confirm** (red button on the quit dialog)
    - **Return Home** (post-battle screen)
-3. `Undo` / `Clear all` are available if you mis-click.
-4. Press **Save** — this writes `controls` to `settings.json`.
+   - **Retry spot 1/2/3** (the three taps made when a resource scan fails)
+4. `Undo` / `Clear selected` / `Clear all` are available if you mis-click.
+5. Press **Save** — this writes `controls` to `settings.json`.
 
 Recalibrate after a game update that moves button positions; there is no model
 retraining involved.
 
 To re-fix just **one** button later (e.g. a single spot moved): click its row
-in the progress list on the left, click its new spot on the screenshot, then
-press **Save** — the other buttons keep their saved positions. `Undo` reverses
-the last click, and `Clear selected` unsets only the currently selected button.
+in the progress list on the left, navigate the game to that button's screen and
+press **Recapture**, click its new spot on the screenshot, then press **Save** —
+the other buttons keep their saved positions. `Undo` reverses the last click,
+and `Clear selected` unsets only the currently selected button.
 
 > Note: if you calibrated with an older version of this project, your
 > `settings.json` will be missing buttons that were once YOLO-detected
@@ -46,15 +52,18 @@ the last click, and `Clear selected` unsets only the currently selected button.
 
 > Tip: calibrate while on the exact screens the bot will click, i.e. have the
 > main village up (for Attack + Find Match), then the attack screen (Attack),
-> then in a battle (Surrender), then the victory screen (Return Home). The bot
-> uses the same relative spots every time, so a single calibration on your
-> normal screen is usually enough for the Attack/Find/Attack buttons — but
+> then in a battle (Surrender), then the victory screen (Return Home). Press
+> **Recapture** between screens so each click lands on the right screenshot —
+> the bot uses the same relative spots every time, so a single calibration on
+> your normal screen is usually enough for the Attack/Find/Attack buttons, but
 > being on the actual screen for each click makes it unambiguous.
 
 ## Run the farm
 
-Easiest: double-click **`run.bat`** (selects `.venv`, checks that the
-dependencies import, and starts `main.py`).
+Easiest: double-click **`run.bat`**. On first run it offers to create the
+`.venv` and install the dependencies (a few GB, several minutes), then verifies
+they import, warns if `models\best.pt` is missing, and starts `main.py`. Later
+runs just verify the environment and launch.
 
 Manual:
 
@@ -91,13 +100,24 @@ bot keeps running either way. The status line shows
   `loading` first, so the first raid is not slowed down).
 - Scans each base's visible resources; attacks (goblins) when your thresholds
   are met, otherwise clicks **Next**.
+- Attacks in **waves**: each wave sweeps every gold/elixir/dark store row, then
+  re-scans the base and compares the number of resource providers left with the
+  number seen at scan time. It keeps deploying waves until at least
+  `attack.drain_ratio` (default **80%**) of the providers are gone, or
+  `attack.time_limit` seconds (default **90**, i.e. 1.5 min, counted from the
+  first sweep) have passed — whichever comes first. Only then does it surrender
+  and read the loot.
 - If a scan can't read the gold/elixir labels (usually a screen still loading),
-  taps the calibrated retry spots (`retry_btn_1`, `retry_btn_2`, `retry_btn_3`)
-  and restarts the raid loop instead of ending the session. It only stops after
+  backs out and restarts the raid loop instead of ending the session. The first
+  consecutive *resource*-scan failure taps `surr` (the values are often hidden
+  behind a dialog/battle); after that it taps the calibrated retry spots
+  (`retry_btn_1`, `retry_btn_2`, `retry_btn_3`). Each failure also pushes a
+  notification with a screenshot of the failing screen. It only stops after
   `recovery.scan_restart_limit` failures **in a row** (default 3), resetting the
   count on any successful scan.
-- Reads the post-battle loot into the running totals.
-- Reads the post-battle loot into running totals; surrenders and returns home.
+- Reads the post-battle loot into the running totals, then returns home. If
+  `recovery.scan_restart_limit` raids in a row all collect 0 loot (usually a
+  missed surrender), it notifies and stops so a desync can't run silently.
 - Stops when goals are met, F12 is pressed, or an error is reported.
 
 ## Tuning timings
@@ -107,21 +127,49 @@ list the ones you want to change; the rest keep their defaults. Useful when your
 emulator is slow and a step fires before the screen is ready:
 
 ```json
-{ "waits": { "surr_conf": 1.0, "return_home": 1.5 } }
+{ "waits": { "surr_conf": 1.0, "return_home": 1.5, "attack_settle": 6.0 } }
 ```
 
+Each deploy wave always sweeps every provider row once it starts, then pauses
+`attack_wave_settle` (default 5.0) before re-scanning, so if your troops need
+longer to damage the stores raise `attack_wave_settle`; `attack_settle` (default
+5.0) is the final pause before surrendering. A mid-attack Stop is honored before
+the first deploy and between waves, never mid-sweep.
+
+The wave loop itself is tuned under `attack` (not `waits`):
+
+```json
+{ "attack": { "drain_ratio": 0.8, "time_limit": 90 } }
+```
+
+`drain_ratio` is the fraction of providers that must be gone before it stops
+attacking (0.8 = 80%); `time_limit` is the hard cap in seconds (there is no wave
+cap, so the clock is the guaranteed stop).
+
 The post-battle loot read is **data-driven**: instead of a fixed pause it
-re-reads the screen every `scan_post_interval` (0.3)s and continues as soon as
-the loot values come back, giving up after `scan_post_timeout` (12.0)s (that
-raid is then counted as 0 with a warning). So you rarely need to pad the
-surrender steps — raise `scan_post_timeout` only if your loot screen is very
-slow to appear.
+re-reads the screen every `scan_post_interval` (default 0.3s) and keeps the
+highest value seen per resource, ignoring boxes the model tags twice for the same
+row. It stops as soon as Gold, Elixir **and** Dark are all non-zero — or earlier
+once the summary's **Return Home** button is on screen and at least one value is
+real (a resource genuinely at 0 shouldn't force the full wait). An early,
+still-animating frame can read 0, so keep the interval short; it gives up after
+`scan_post_timeout` (12.0)s, keeping whatever it could read (a raid that read
+nothing at all counts as 0 with a warning).
 
 Each raid logs what it counted and the running total, e.g.
 `loot this raid: Gold +128400 | Elixir +92000 | Dark +320 (totals Gold 1284000 | ...)`.
 The raw OCR text behind each number is written to `logs/bot.log` at DEBUG level,
 so if a total ever looks wrong you can compare the logged values against the
 in-game loot screen.
+
+Each wave logs the provider count (`providers at scan: 15 (gold 9 / elixir 5 /
+dark 1)`), and just before it surrenders the bot takes a final reading:
+`drain at surrender: providers 3/15 remaining (80% drained)`. At the end of the
+session — goals met, an error, **or** a manual stop — it logs every raid's
+result, e.g. `drain per raid: 73%, 91%, 80% | average 81% over 3 raid(s)`. The
+average is also included in the completion notification. If a raid errors out it
+is **not** counted: error notifications report the average of the **previous
+fully-completed** raids, so you still get a picture of the session so far.
 
 Each tap line in the log shows the wait that followed it, e.g.
 `tap surr_conf at (987, 603) [0.617, 0.670] wait 1.0s`. The full per-step
@@ -144,7 +192,7 @@ know if something fails while you are away. It is **off by default**.
 
 3. Start the bot. You will get a push when:
    - the farm loop hits an **error** (the emulator screen is attached),
-   - a session **completes** its goals (current totals attached),
+   - a session **completes** its goals (current totals + average drain attached),
    - the bot **refuses to start** because buttons are not calibrated.
 
 Errors and completion attach a screenshot saved to `logs/error_<timestamp>.jpg`

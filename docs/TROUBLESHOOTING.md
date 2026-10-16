@@ -30,11 +30,16 @@ Set all 11 buttons, Save, relaunch `main.py`.
 ## "Could not find [class] after X attempts"
 
 A single scan gave up: YOLO saw no storehouses or gold text within
-`max_retries` captures. This is no longer fatal — the bot taps the calibrated
-retry spots (`retry_btn_1`, `retry_btn_2`, `retry_btn_3`; no attack has started)
-and restarts the raid loop from the beginning. If this happens
-`recovery.scan_restart_limit` times **in a row** (default 3) the bot stops and
-sends an error notification. To make it more tolerant:
+`max_retries` captures. This is no longer fatal — the bot backs out and restarts
+the raid loop from the beginning. On the **first** consecutive *resource*-scan
+failure it taps `surr` (the values are often hidden behind a dialog/battle);
+after that, and for base-layout failures, it taps the calibrated retry spots
+(`retry_btn_1`, `retry_btn_2`, `retry_btn_3`; no attack has started). Each
+failure also pushes a notification with a screenshot of the failing screen
+(saved under `logs/error_*.jpg`) — the easiest way to see what the bot actually
+saw. If this
+happens `recovery.scan_restart_limit` times **in a row** (default 3) the bot
+stops (the last notification says "stopping"). To make it more tolerant:
 
 - Raise `recovery.scan_restart_limit` in `settings.json`.
 - Slow the scans down with `waits.scan_base_first` / `scan_treasures_first`.
@@ -42,6 +47,26 @@ sends an error notification. To make it more tolerant:
 - Check `logs/bot.log` for what phase it was in.
 - Confirm the model `models/best.pt` includes that class name (see labels in
   `config.py`).
+
+## "No loot read for N raids in a row" (bot stopped)
+
+The bot finished `recovery.scan_restart_limit` raids **in a row** without reading
+any post-battle Gold/Elixir/Dark. That almost always means the surrender didn't
+take effect (the screen never reached the loot summary), so the raid counted 0
+and the bot may be desynced. Check:
+
+- The `surr` / `surr_conf` calibration — re-run `calibrate.py` and use
+  **Recapture** while actually in a battle so you click the real buttons.
+- `waits.surr` / `waits.surr_conf` — if your quit dialog is slow, raise them.
+- A raid where **no troops were actually deployed** also has no loot summary
+  (surrendering without attacking goes straight home). If the log shows
+  `providers at scan: 0` / `wave 1: sweeping 0 row(s)` the layout scan found no
+  storehouse rows to sweep, so the base was never attacked.
+- `logs/bot.log`: each raid logs `loot this raid: Gold +… | Elixir +… | Dark +…`,
+  and unreadable post-battle reads log `post-battle loot not readable`.
+
+The watchdog exists so this can't run silently all night; raise
+`recovery.scan_restart_limit` if you'd rather tolerate more empty raids.
 
 ## "Failed to load YOLO model"
 

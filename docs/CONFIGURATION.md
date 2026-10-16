@@ -61,9 +61,14 @@ tap: `attack_btn_home` (0.5), `find_btn` (0.5), `nxt_btn` (1.5), `attack_btn`
 **Scan graces** are the settle time before a scan tries again:
 `scan_base_first` (3.0), `scan_base_retry` (2.0), `scan_treasures_first` (1.0),
 `scan_treasures_retry` (0.5).
+**Attack settle** is `attack_settle` (5.0) — the pause after the deploy sweep
+and before the surrender taps, giving the deploy a moment to land.
 **Post-battle loot** is data-driven instead of fixed: the bot re-reads the
-screen every `scan_post_interval` (0.3)s and continues the moment the loot
-values appear, giving up after `scan_post_timeout` (12.0)s (that raid is then
+screen every `scan_post_interval` (default 0.3s), keeps the highest value seen
+per resource (dropping boxes the model tags twice for one row), and stops once
+Gold, Elixir and Dark are all non-zero — or earlier when the summary's Return
+Home button is visible and a value is readable. It gives up after
+`scan_post_timeout` (12.0)s, keeping whatever it read (a totally empty read is
 counted as 0 with a warning).
 
 For example, to let the post-battle loot screen take longer before giving up:
@@ -111,9 +116,11 @@ ntfy.sh's 2 MB attachment limit).
 
 Controls how the bot recovers when a scan cannot find the gold/elixir labels it
 needs (usually a screen that was still loading). Instead of ending the session,
-the bot taps the calibrated retry spots (`retry_btn_1`, `retry_btn_2`, then
-`retry_btn_3`, one tap each — set them in `calibrate.py`) and starts the raid
-loop over.
+it backs out and starts the raid loop over. On the **first** consecutive
+*resource*-scan failure it taps `surr` (the values are often hidden behind a
+dialog or a lingering battle); after that, and for base-layout failures, it taps
+the calibrated retry spots (`retry_btn_1`, `retry_btn_2`, then `retry_btn_3`, one
+tap each — set them in `calibrate.py`).
 
 ```json
 "recovery": {
@@ -123,7 +130,12 @@ loop over.
 
 | Key | Default | Purpose |
 | --- | --- | --- |
-| `scan_restart_limit` | `3` | How many scans may fail **in a row** before the bot gives up. The count resets to 0 as soon as any scan succeeds, so intermittent misses keep the session alive. |
+| `scan_restart_limit` | `3` | How many scans may fail **in a row** before the bot gives up (the first failure is the `surr` tap, the rest use the retry spots). The count resets to 0 as soon as any scan succeeds, so intermittent misses keep the session alive. |
+
+The same limit also drives the **0-loot watchdog**: if that many raids in a row
+collect 0 Gold, 0 Elixir and 0 Dark (usually a missed surrender leading to an
+unreadable post-battle screen), the bot notifies and stops rather than running
+desynced.
 
 When the limit is reached the bot sends an error notification (if `notifications`
 is configured) and stops.

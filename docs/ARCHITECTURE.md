@@ -111,21 +111,41 @@ clicking the new spots, no YOLO retraining.
    `("find_btn")`, `("attack_btn")`, ~0.5s between taps (calibrated).
 2. **Phase 2 — search & decide**: `_scan_base_layout()` (YOLO storehouses) +
    `_scan_treasures()` (YOLO boxes → OCR values). If resources meet targets →
-   `_initiate_attack()` (calibrated `s_goblin` tap + horizontal sweep along
-   store rows above the calibrated `surr` Y), then
+   `_initiate_attack()` (multi-wave: taps `s_goblin` and sweeps the horizontal
+   rows of every gold/elixir/dark store above the calibrated `surr` Y, then
+   re-scans and repeats the wave until `attack.drain_ratio` of the providers seen
+   at scan time are gone, `attack.time_limit` seconds elapse, or a Stop is
+   requested between waves; a started sweep always runs to completion, then
+   pauses `waits.attack_settle`), then
    `_press_button("surr")` (opens the quit
    dialog), `_press_button("surr_conf")` (red confirm),
-   `_scan_post_game()` (data-driven: polls until the loot values are readable,
-   else 0 after the timeout), add to totals, `_press_button("return_home")`.
+   `_scan_post_game()` (data-driven: polls every interval, keeps the max value
+   per resource and drops duplicate-row boxes, stopping when all three read
+   non-zero or the summary's Return Home is up with a readable value; else
+   best-of/0 at the timeout), add to totals, `_press_button("return_home")`.
    Otherwise `_press_button("nxt_btn")` to skip and loop.
-3. **Scan-failure recovery**: if `_scan_base_layout`/`_scan_treasures` give up
-   they raise `ScanFailed`; the loop taps `retry_btn_1`, `retry_btn_2`, then
-   `retry_btn_3` (calibrated) and restarts at Phase 1. A consecutive-failure
-   streak counter is reset by any successful scan and, at
+3. **Scan-failure recovery**: if a scan gives up it raises `ScanFailed` and the
+   loop restarts at Phase 1. Every failure first sends a notification with a
+   screenshot of the failing screen (captured before the recovery taps). If the
+   **resource** scan (`_scan_treasures`) fails
+   on the *first* consecutive failure it raises `TreasureScanFailed` and the bot
+   taps `surr` (the resource row is often hidden behind a dialog/battle); from
+   the second failure on, and for every base-layout failure, it taps
+   `retry_btn_1`, `retry_btn_2`, then `retry_btn_3` (calibrated). A
+   consecutive-failure streak counter is reset by any successful scan and, at
    `recovery.scan_restart_limit`, stops the session (with a notification).
-4. Stop when totals exceed goals, F12 pressed, or an error occurs.
+4. **0-loot watchdog**: a raid whose post-battle Gold/Elixir/Dark are all 0
+   (usually a missed surrender / unreadable post-battle screen) increments a
+   separate streak; any raid with loot resets it. At
+   `recovery.scan_restart_limit` empty raids in a row the bot notifies and stops,
+   so a desync can't run silently all night.
+5. Stop when totals exceed goals, F12 pressed, or an error occurs.
 
-`_scan_base_layout` and `_scan_treasures` retry up to `config.max_retries` with
-0.5–3s sleeps, then raise `ScanFailed`; `_scan_post_game` polls every
-`scan_post_interval` up to `scan_post_timeout` and returns 0 on timeout. On F12 a
-`RuntimeError("Bot stopped")` unwinds the loop cleanly (it is not a `ScanFailed`).
+`_scan_base_layout` retries up to `config.max_retries` then raises `ScanFailed`;
+`_scan_treasures` does the same but raises `TreasureScanFailed` (a `ScanFailed`
+subclass); `_scan_post_game` polls every `scan_post_interval` up to `scan_post_timeout`,
+keeping the max value per resource and dropping boxes that overlap a row already
+read; it returns once all three are non-zero, or once `return_home` is visible
+with a readable value (otherwise the best partial, or 0 if nothing was
+readable). On F12 a `RuntimeError("Bot stopped")` unwinds the loop cleanly (it
+is not a `ScanFailed`).

@@ -78,6 +78,7 @@ All coordinates are frame-relative (guest pixels in ADB mode).
 
 ```python
 class ScanFailed(RuntimeError)   # raised when a scan can't read its labels
+class TreasureScanFailed(ScanFailed)   # subclass raised by _scan_treasures only
 def __init__(self, config, window_manager, vision_manager,
              automation_controller, msg_queue, controls=None, waits=None,
              notifier=None, recovery=None)
@@ -92,7 +93,13 @@ def _button_coords(self, name) -> (x, y)   # normalized * guest resolution
 def _scan_treasures(self) -> dict[str, str]
 def _scan_base_layout(self) -> dict[str, list[tuple]]
 def _scan_post_game(self) -> dict[str, str]
-def _initiate_attack(self, base: dict)
+def _dump_post_frame(self, frame, poll)   # diagnostic only; needs COC_POST_DEBUG
+def _provider_counts(self, base) -> dict  # stores per class (gold/elixir/dark)
+def _count_providers_now(self) -> int | None  # one-shot, stop-ignoring
+def _attack_rows(self, base) -> list      # sweep rows (guest y) above surr
+def _sweep_rows(self, rows) -> int        # deploy one wave, return tap count
+def _drain_summary(self, drains) -> str   # per-raid % + average line
+def _initiate_attack(self, base: dict) -> float | None   # %drained of the raid
 def _farm_loop(self, targets, goals)
 ```
 
@@ -101,20 +108,72 @@ def _farm_loop(self, targets, goals)
 `waits` overrides `DEFAULT_WAITS` (module-level dict) — merge is
 `{**DEFAULT_WAITS, **waits}` with each value clamped to `>= 0`, so unknown or
 missing keys fall back to code defaults. Keys are the button names plus
-`scan_base_first/retry`, `scan_treasures_first/retry`, plus
+`scan_base_first/retry`, `scan_treasures_first/retry`, `attack_settle`,
+`attack_wave_settle`, plus
 `scan_post_interval` and `scan_post_timeout` for the data-driven post-battle
-read (`_scan_post_game` polls every interval until the loot values appear, or
-returns `{}` after the timeout so the raid counts as 0).
+read: `_scan_post_game` polls every interval at a slightly reduced confidence
+(a missed Dark Elixir box is common), keeps the max value per resource, ignores
+boxes that overlap a row already read (`_iou`), and returns early once all three
+are non-zero — or once the summary's `return_home` button is visible and any
+value is readable (a genuinely empty resource shouldn't force the whole
+timeout). At the timeout it returns the best partial, or `{}` so the raid counts
+as 0. Point the `COC_POST_DEBUG` environment variable at a directory to make
+`_scan_post_game` save every poll frame there as a full-res PNG (diagnostic
+only; off by default).
+
+`_initiate_attack` deploys goblin **waves** until the base is drained. It counts
+the resource providers (gold/elixir/dark stores) seen at scan time via
+`_provider_counts`, then loops: `_attack_rows` (rows from all three classes, kept
+`_ATTACK_ROW_MARGIN` above the surr Y and merged within `_ATTACK_ROW_TOLERANCE`)
+→ tap `s_goblin` → `_sweep_rows` → sleep `waits.attack_wave_settle` →
+`_scan_base_layout()` again → if at least `attack.drain_ratio` (default 0.8) of
+the providers are gone, stop; else deploy another wave. The loop also stops after
+`attack.time_limit` seconds (default 90, measured from the first sweep), on a
+Stop between waves, or if a re-scan raises `ScanFailed` (then it surrenders
+gracefully). A Stop is honored before the first deploy and between waves but
+never mid-sweep, so a started sweep always completes; `_sweep_rows` logs
+`attack sweep done: …`. A failed deploy tap logs the coordinate and propagates
+(aborting the session). After the loop it sleeps `waits.attack_settle` (default
+5.0) via `_sleep` before the caller surrenders. `attack` overrides
+`DEFAULT_ATTACK` (module-level dict) like `recovery`.
+
+Before that final settle, `_initiate_attack` takes one **pre-surrender reading**
+via `_count_providers_now` (single capture, no retries, **no stop check**, so a
+manually-stopped raid still reads the live screen) and logs
+`drain at surrender: providers R/N remaining (D% drained)` — falling back to the
+last known count (`, last known`) if the capture fails. It then **returns** the
+drained fraction (`0.0–1.0`) or `None` when no providers were detected. A hard
+error raises earlier and skips this entirely, so an aborted raid is not recorded.
+
+`_farm_loop` keeps `raid_drains` and, in its `finally` (so it runs on goals-met,
+error, **and** manual stop), logs `_drain_summary` — e.g. `drain per raid: 73%,
+91%, 80% | average 81% over 3 raid(s)` (`none completed` if there were no raids).
+The same average is appended to the completion notification and to **every error
+push** (generic failures, the stopped `RuntimeError`, the scan give-up, and the
+0-loot stop) via `_drain_average`. A raid is only added to `raid_drains` after its
+post-battle read succeeds, so an error mid-raid is excluded and every error push
+reports the average of the **previous fully-completed** raids only. Transient
+scan failures that recover do not carry the average; only the final, stopping one.
 
 `recovery` overrides `DEFAULT_RECOVERY` (module-level dict) the same way, with
-the single key `scan_restart_limit` (default 3). `_scan_treasures` and
-`_scan_base_layout` raise `ScanFailed` (a `RuntimeError` subclass) when they
-exhaust their retries. `_farm_loop` warms up the models (`vision.load()`) before
-the first raid, then wraps only those two scan calls in `except ScanFailed`:
-each failure taps `retry_btn_1`, `retry_btn_2`, then `retry_btn_3` (the attack
-has not started, so no `surr_conf` or `return_home`) and restarts the outer loop;
-the count resets on any successful scan; on the `scan_restart_limit`-th
-consecutive failure it notifies and stops.
+the single key `scan_restart_limit` (default 3). `_scan_base_layout` raises
+`ScanFailed` and `_scan_treasures` raises `TreasureScanFailed` (a `ScanFailed`
+subclass) when they exhaust their retries. `_farm_loop` warms up the models
+(`vision.load()`) before the first raid, then wraps only those two scan calls in
+`except ScanFailed`. Every failure first calls `_notify` with a screenshot of the
+failing screen (`_capture_screenshot` runs before the recovery taps below, so the
+image is the pre-recovery screen); the terminal one adds " (stopping)". The
+**first** consecutive failure, if it was the resource scan
+(`isinstance(e, TreasureScanFailed) and scan_streak == 1`), taps `surr`; every
+other failure taps `retry_btn_1`, `retry_btn_2`, then `retry_btn_3` (the attack
+has not started, so no `surr_conf` or `return_home`) — both then restart the
+outer loop. The count resets on any successful scan; on the
+`scan_restart_limit`-th consecutive failure it stops (the notification already
+said "stopping").
+
+A separate `zero_loot_streak` watchdog counts raids whose post-battle Gold,
+Elixir and Dark are all 0 (a missed surrender / unreadable end screen); any raid
+with loot resets it, and at the same `scan_restart_limit` it notifies and stops.
 A plain `RuntimeError("Bot stopped")` from a stopped scan is still treated as a
 clean stop, not a failure.
 
@@ -176,6 +235,7 @@ class Calibrator:
     def __init__(self, root, adb, settings)
     def select(self, name)   # jump to a button (single-button edit mode)
     def on_canvas_click(self, event)
+    def recapture(self)      # grab the screen again (keeps selection/undo)
     def undo(self); def clear_selected(self); def clear_all(self); def save(self)
 ```
 

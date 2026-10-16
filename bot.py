@@ -29,6 +29,8 @@ DEFAULT_WAITS = {
     "scan_treasures_retry": 0.5,
     "scan_post_interval": 0.3,
     "scan_post_timeout": 12.0,
+    "attack_settle": 5.0,
+    "attack_wave_settle": 5.0,
 }
 
 # ntfy.sh caps attachments at 2 MB, so notification captures are downscaled and
@@ -36,10 +38,53 @@ DEFAULT_WAITS = {
 NOTIFY_IMAGE_MAX_WIDTH = 1280
 NOTIFY_IMAGE_QUALITY = 75
 
+# The post-battle YOLO model sometimes labels one on-screen row as two different
+# resources (e.g. the Gold row also tagged as Elixir). Boxes overlapping this
+# much are treated as the same row and only counted once.
+_BOX_OVERLAP_IOU = 0.6
+
+
+def _iou(a, b):
+    """Intersection-over-union of two (x1, y1, x2, y2) boxes."""
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    iw = min(ax2, bx2) - max(ax1, bx1)
+    ih = min(ay2, by2) - max(ay1, by1)
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    inter = iw * ih
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
 # Recovery/beat-the-runtime knobs (settings.json -> "recovery").
 DEFAULT_RECOVERY = {
     "scan_restart_limit": 3,
 }
+
+# Multi-wave attack knobs (settings.json -> "attack"). The bot keeps re-deploying
+# goblin waves until at least `drain_ratio` of the resource providers counted at
+# scan time are gone, or `time_limit` seconds (measured from the first sweep)
+# have elapsed, whichever comes first. There is no wave cap on purpose: the
+# clock is the only guaranteed stop (the bot cannot read remaining troops).
+DEFAULT_ATTACK = {
+    "drain_ratio": 0.8,
+    "time_limit": 30.0,
+}
+
+# Sweep geometry (preserved from the notebook): tap every `_SWEEP_STEP` px from
+# the left edge to `_SWEEP_RIGHT_MARGIN` before the right edge.
+_SWEEP_STEP = 50
+_SWEEP_RIGHT_MARGIN = 100
+
+# Only rows at least this far *above* the surr button are swept, so a sweep can
+# never land on the surr tap itself.
+_ATTACK_ROW_MARGIN = 100
+
+# Provider rows closer than this (guest px) are merged into a single sweep row,
+# so a gold and an elixir store on the same line are only swept once.
+_ATTACK_ROW_TOLERANCE = 20
 
 
 class ScanFailed(RuntimeError):
@@ -48,6 +93,16 @@ class ScanFailed(RuntimeError):
     Unlike other RuntimeErrors (ADB failure, uncalibrated button, clean stop),
     this is treated as recoverable: the farm loop taps the retry spots and
     restarts, and only alerts after several failures in a row.
+    """
+
+
+class TreasureScanFailed(ScanFailed):
+    """The resource (gold/elixir/dark) values could not be detected at all.
+
+    A subclass of :class:`ScanFailed` so callers can special-case it: the first
+    consecutive failure of this kind taps ``surr`` (rather than the retry spots)
+    before restarting Phase 1 — the resource row is often hidden by a dialog or
+    a lingering battle, and ``surr`` backs out of those states.
     """
 
 
@@ -68,6 +123,7 @@ class CocBot:
         waits: dict | None = None,
         notifier: Notifier | None = None,
         recovery: dict | None = None,
+        attack: dict | None = None,
     ):
         self.config = config
         self.window = window_manager
@@ -79,6 +135,7 @@ class CocBot:
             k: max(0.0, float(v)) for k, v in {**DEFAULT_WAITS, **(waits or {})}.items()
         }
         self.recovery = {**DEFAULT_RECOVERY, **(recovery or {})}
+        self.attack = {**DEFAULT_ATTACK, **(attack or {})}
         self.notifier = notifier or Notifier()
 
         self._stop_event = threading.Event()
@@ -163,6 +220,26 @@ class CocBot:
     def _show_totals(self, totals: dict):
         if self.msg_queue is not None:
             self.msg_queue.put({"type": "totals", "data": totals})
+
+    @staticmethod
+    def _drain_summary(drains: list) -> str:
+        """End-of-session line: every raid's %drained plus the average."""
+        if not drains:
+            return "drain per raid: none completed"
+        per = ", ".join(f"{d * 100:.0f}%" for d in drains)
+        avg = sum(drains) / len(drains)
+        return (
+            f"drain per raid: {per} | "
+            f"average {avg * 100:.0f}% over {len(drains)} raid(s)"
+        )
+
+    @staticmethod
+    def _drain_average(drains: list) -> str:
+        """Short ``' | avg drain N%'`` suffix for notifications ('' if no raids)."""
+        if not drains:
+            return ""
+        avg = sum(drains) / len(drains)
+        return f" | avg drain {avg * 100:.0f}%"
 
     # ---- Notifications (best-effort, never disturb the loop) ----
 
@@ -312,7 +389,7 @@ class CocBot:
                 logger.debug(f"base treasures read: {result}")
                 return result
 
-        raise ScanFailed(
+        raise TreasureScanFailed(
             f"Could not find treasures {targets} after {max_retries} attempts"
         )
 
@@ -354,15 +431,37 @@ class CocBot:
     def _scan_post_game(self):
         """
         Read the post-battle loot (YOLO boxes -> OCR values), driven by data
-        rather than a fixed pause: capture immediately and keep re-reading every
-        `scan_post_interval` seconds until the loot values come back, then return
-        them at once. If nothing is readable within `scan_post_timeout`, warn and
-        return {} so the raid counts as 0 (the caller adds via .get(..., 0)).
+        rather than a fixed pause.
+
+        The first frames after confirming the surrender are usually still
+        rendering (blank loot, or only some labels drawn), and a single early
+        read therefore reports 0 even for a successful attack. Since the summary
+        is static while the bot holds on it, poll for the whole timeout and keep
+        the maximum value read per resource: OCR misses read 0, so the max over
+        the window recovers the real number once the screen settles. Returns
+        early once all three resources are non-zero; at timeout returns the best
+        (possibly partial) values so the raid still counts what it could read.
+
+        The boxes are detected at a slightly lower confidence than the global
+        default (a missed Dark Elixir box is common) and the summary's Return
+        Home button is used as a settle signal: once it is drawn and any resource
+        has a real value, the read stops, so a genuinely empty resource does not
+        force a full-timeout wait.
         """
-        targets = [self.config.POST_GOLD, self.config.POST_ELIXIR, self.config.POST_D_ELIXIR]
+        targets = [
+            self.config.POST_GOLD,
+            self.config.POST_ELIXIR,
+            self.config.POST_D_ELIXIR,
+        ]
         interval = self.waits["scan_post_interval"]
         deadline = time.time() + self.waits["scan_post_timeout"]
-        started = time.time()
+        # The post-battle labels are small and low-contrast; at the default
+        # confidence a real box (often Dark Elixir) is missed, while pushing the
+        # confidence much lower starts inventing boxes, so use 0.35 but never go
+        # below 0.3 even if config.conf is set lower.
+        post_conf = max(0.3, min(self.config.conf, 0.35))
+        summary_marker = self.config.RETURN_HOME
+        best = {}
         polls = 0
 
         while True:
@@ -370,65 +469,265 @@ class CocBot:
                 raise RuntimeError("Bot stopped")
 
             frame = self.window.capture_window()
-            details = self.vision.detect_with_details(frame, targets)
+            details = self.vision.detect_with_details(
+                frame, targets + [summary_marker], conf=post_conf
+            )
             polls += 1
 
-            if details:
-                result = {}
-                for cls in targets:
-                    if cls in details:
-                        bbox = details[cls][0]["bbox"]
-                        result[cls] = self.vision.read_number(frame, bbox)
-                if result:
-                    logger.debug(f"post-game loot read: {result}")
-                    logger.debug(
-                        f"post-game loot ready after {polls} poll(s) "
-                        f"({time.time() - started:.1f}s)"
-                    )
-                    return result
+            kept = []
+            for cls in targets:
+                for item in details.get(cls, []):
+                    bbox = item["bbox"]
+                    # Skip a box that is really the same row as one already read
+                    # (the model sometimes tags one row as two resources).
+                    if any(_iou(bbox, seen) > _BOX_OVERLAP_IOU for seen in kept):
+                        continue
+                    kept.append(bbox)
+                    value = int(self.vision.read_number(frame, bbox))
+                    if value > best.get(cls, 0):
+                        best[cls] = value
+
+            logger.debug(f"post-game poll {polls}: {best}")
+            self._dump_post_frame(frame, polls)
+
+            if all(best.get(cls, 0) > 0 for cls in targets):
+                result = {cls: str(v) for cls, v in best.items()}
+                logger.debug(f"post-game loot read: {result} (after {polls} poll(s))")
+                return result
+
+            # The summary is on screen once its Return Home button is drawn; if we
+            # already have a real number, stop now. A resource still at 0 is
+            # genuinely empty rather than unreadable, so polling the rest of the
+            # window would only waste time.
+            if details.get(summary_marker) and any(v > 0 for v in best.values()):
+                result = {cls: str(v) for cls, v in best.items()}
+                logger.debug(
+                    f"post-game loot read: {result} "
+                    f"(summary up after {polls} poll(s))"
+                )
+                return result
 
             if time.time() >= deadline:
-                self._log(
-                    f"post-battle loot not readable after "
-                    f"{self.waits['scan_post_timeout']:g}s; counted as 0"
+                if not any(v > 0 for v in best.values()):
+                    self._log(
+                        f"post-battle loot not readable after "
+                        f"{self.waits['scan_post_timeout']:g}s; counted as 0"
+                    )
+                    return {}
+                result = {cls: str(v) for cls, v in best.items()}
+                logger.debug(
+                    f"post-game loot read: {result} (partial after {polls} poll(s))"
                 )
-                return {}
+                return result
 
-            self._sleep(self.waits["scan_post_interval"], why="post-game loot poll")
+            self._sleep(interval, why="post-game loot poll")
 
-    # ---- Attack logic (preserved verbatim) ----
+    def _dump_post_frame(self, frame, poll):
+        """
+        Diagnostic only: when the ``COC_POST_DEBUG`` environment variable points
+        at a directory, save every post-game poll frame there as a full-res PNG
+        so the post-battle screen can be inspected offline.
+        """
+        debug_dir = os.environ.get("COC_POST_DEBUG")
+        if not debug_dir:
+            return
+        try:
+            os.makedirs(debug_dir, exist_ok=True)
+            path = os.path.join(
+                debug_dir,
+                "post_" + time.strftime("%Y%m%d_%H%M%S") + f"_poll{poll}.png",
+            )
+            cv2.imwrite(path, frame)
+        except Exception as e:
+            logger.debug(f"post-frame dump failed: {e}")
+
+    # ---- Attack logic ----
+
+    def _provider_counts(self, base: dict) -> dict:
+        """Number of detected stores per provider class in ``base``."""
+        return {
+            cls: len(base.get(cls, []))
+            for cls in (self.config.GOLDS, self.config.ELIXIRS, self.config.D_ELIXIRS)
+        }
+
+    def _count_providers_now(self) -> int | None:
+        """
+        Best-effort single-shot provider count for the pre-surrender reading.
+        Unlike ``_scan_base_layout`` it does not retry and does **not** check the
+        stop event, so it still reads after a manual stop. Returns the total
+        store count, or ``None`` if the frame can't be read (ADB down, etc.).
+        """
+        try:
+            frame = self.window.capture_window()
+            details = self.vision.detect_with_details(
+                frame,
+                [self.config.GOLDS, self.config.ELIXIRS, self.config.D_ELIXIRS],
+            )
+            return sum(self._provider_counts(details).values())
+        except Exception as e:
+            logger.debug(f"pre-surrender provider scan failed: {e}")
+            return None
+
+    def _attack_rows(self, base: dict) -> list:
+        """
+        Guest-pixel y of every sweep row. Rows come from all three provider
+        classes (gold/elixir/dark), keep only the ones at least
+        ``_ATTACK_ROW_MARGIN`` above the surr button (so a sweep never taps
+        surr), and merge rows closer than ``_ATTACK_ROW_TOLERANCE`` so a store is
+        not swept twice.
+        """
+        _, limit = self._button_coords(self.config.SURR_BTN)
+        rows = []
+        for cls in (self.config.GOLDS, self.config.ELIXIRS, self.config.D_ELIXIRS):
+            for item in base.get(cls, []):
+                y = item[1]
+                if y >= limit - _ATTACK_ROW_MARGIN:
+                    continue
+                if any(abs(y - seen) <= _ATTACK_ROW_TOLERANCE for seen in rows):
+                    continue
+                rows.append(y)
+        return rows
+
+    def _sweep_rows(self, rows: list) -> int:
+        """
+        Deploy goblins across every row and return the total tap count. A failing
+        tap is logged with its coordinate and re-raised (aborting the session).
+        """
+        started = time.time()
+        total_taps = 0
+        for k in rows:
+            row_taps = 0
+            for a in range(
+                self.window.win_left,
+                self.window.win_width - _SWEEP_RIGHT_MARGIN,
+                _SWEEP_STEP,
+            ):
+                logger.debug(f"tap sweep at ({a}, {k})")
+                try:
+                    self.auto.click(a, k)
+                except Exception as e:
+                    logger.error(f"deploy tap failed at ({a}, {k}): {e}")
+                    raise
+                row_taps += 1
+            total_taps += row_taps
+            self._log(f"swept row y={k}: {row_taps} taps")
+        self._log(
+            f"attack sweep done: {len(rows)} row(s), {total_taps} taps "
+            f"in {time.time() - started:.1f}s"
+        )
+        return total_taps
 
     def _initiate_attack(self, base: dict):
         """
-        Original initiate_attack logic.
-        base dict comes from _scan_base_layout():
-          {class_name: [(cx, cy), ...], ...}
-        goblin and surr are calibrated controls (not part of the scan).
+        Deploy goblin waves until the resource providers are drained. ``base``
+        comes from ``_scan_base_layout``: ``{class_name: [(cx, cy), ...], ...}``;
+        goblin and surr are calibrated controls, not part of the scan.
+
+        The count of providers (gold/elixir/dark stores) seen at scan time is the
+        baseline. Each wave deploys goblins across every provider row, then the
+        base is re-scanned and the remaining provider count compared: if at least
+        ``attack.drain_ratio`` (default 80%) are gone the loop stops, otherwise
+        another wave is deployed — until ``attack.time_limit`` seconds (default
+        90, measured from the first sweep) have passed, a Stop is requested, or a
+        re-scan fails. There is no wave cap: the clock is the only guaranteed
+        stop because the bot cannot read remaining troops.
+
+        A Stop request (F12) is honored before the first deploy and between
+        waves, but never mid-sweep, so a started sweep always completes and troops
+        are not left half-deployed. The final pause before the caller surrenders
+        is ``waits.attack_settle``.
         """
-        _, limit = self._button_coords(self.config.SURR_BTN)
-        attack_coords = []
-        for a in base.get(self.config.GOLDS, []):
-            if a[1] < limit - 100:
-                attack_coords.append(a[1])
+        if self._stop_event.is_set():
+            self._log("attack skipped: stop requested before deploy")
+            return
 
-        self._log(f"Attack coords: {attack_coords}")
-        goblin = self._button_coords(self.config.S_GOBLIN)
-        self._log(f"tap s_goblin (deploy) at ({goblin[0]}, {goblin[1]})")
-        self.auto.click(goblin)
+        drain_ratio = float(self.attack.get("drain_ratio", 0.8))
+        time_limit = float(self.attack.get("time_limit", 90.0))
+        wave_settle = self.waits.get("attack_wave_settle", 5.0)
 
-        for k in attack_coords:
-            # Exact formula from notebook (preserved even if it looks like width/right-edge mix)
-            row_taps = 0
-            for a in range(self.window.win_left, self.window.win_width - 100, 50):
-                if self._stop_event.is_set():
-                    break
-                logger.debug(f"tap sweep at ({a}, {k})")
-                self.auto.click(a, k)
-                row_taps += 1
-            self._log(f"swept row y={k}: {row_taps} taps")
+        counts = self._provider_counts(base)
+        total = sum(counts.values())
+        self._log(
+            f"providers at scan: {total} "
+            f"(gold {counts[self.config.GOLDS]} / "
+            f"elixir {counts[self.config.ELIXIRS]} / "
+            f"dark {counts[self.config.D_ELIXIRS]})"
+        )
+
+        current = base
+        started = None
+        wave = 0
+        remaining = total
+        while True:
+            wave += 1
+            rows = self._attack_rows(current)
+            goblin = self._button_coords(self.config.S_GOBLIN)
+            self._log(f"wave {wave}: sweeping {len(rows)} row(s)")
+            self._log(f"tap s_goblin (deploy) at ({goblin[0]}, {goblin[1]})")
+            self.auto.click(goblin)
+            if started is None:
+                started = time.time()
+            self._sweep_rows(rows)
+
+            self._sleep(wave_settle, why="attack wave settle")
+
             if self._stop_event.is_set():
+                self._log("stop requested between waves; surrendering")
                 break
-        time.sleep(5.0)  # original notebook had a hardcoded sleep here
+
+            elapsed = time.time() - started
+            if elapsed >= time_limit:
+                self._log(
+                    f"attack time limit reached ({elapsed:.0f}s >= "
+                    f"{time_limit:g}s, wave {wave}); surrendering"
+                )
+                break
+
+            if total == 0:
+                self._log("no providers detected; not re-scanning")
+                break
+
+            try:
+                current = self._scan_base_layout()
+            except ScanFailed as e:
+                self._log(f"post-wave rescan failed ({e}); surrendering")
+                break
+
+            counts = self._provider_counts(current)
+            remaining = sum(counts.values())
+            drained = 1.0 - (remaining / total)
+            self._log(
+                f"wave {wave}: providers {remaining}/{total} remaining "
+                f"({drained * 100:.0f}% drained)"
+            )
+            if drained >= drain_ratio:
+                self._log(
+                    f"drain target reached ({drained * 100:.0f}% >= "
+                    f"{drain_ratio * 100:.0f}%) after {wave} wave(s)"
+                )
+                break
+
+        # Final pre-surrender reading: how many providers are left right now.
+        # A manual stop lands here (the wave loop breaks normally); a hard error
+        # raises earlier and skips this, so an erroring raid is not recorded.
+        drained = None
+        if total > 0:
+            now = self._count_providers_now()
+            fresh = now is not None
+            if fresh:
+                remaining = now
+            remaining = max(0, min(remaining, total))
+            drained = 1.0 - (remaining / total)
+            self._log(
+                f"drain at surrender: providers {remaining}/{total} remaining "
+                f"({drained * 100:.0f}% drained"
+                + ("" if fresh else ", last known")
+                + ")"
+            )
+
+        settle = self.waits.get("attack_settle", 5.0)
+        self._sleep(settle, why="attack settle before surrender")
+        return drained
 
     # ---- Farm loop (preserved notebook behaviour) ----
 
@@ -438,6 +737,7 @@ class CocBot:
 
         st_time = time.time()
         totals = {"gold": 0, "elixir": 0, "delixir": 0}
+        raid_drains = []
 
         # Warm up the models up front so there is no stall mid-raid.
         self._set_status("loading")
@@ -449,6 +749,7 @@ class CocBot:
             self._set_status("farming")
             scan_streak = 0
             scan_limit = max(1, int(self.recovery.get("scan_restart_limit", 3)))
+            zero_loot_streak = 0
 
             while not self._stop_event.is_set():
                 # Check total goals
@@ -464,8 +765,9 @@ class CocBot:
                     self._alert(msg)
                     self._notify(
                         "COC Auto-Farm: completed",
-                        f"{msg} — Gold {totals['gold']} | "
-                        f"Elixir {totals['elixir']} | Dark {totals['delixir']}",
+                        f"Gold {totals['gold']} | Elixir {totals['elixir']} | "
+                        f"Dark {totals['delixir']}, in {mins} min"
+                        + self._drain_average(raid_drains),
                         success=True,
                     )
                     break
@@ -492,23 +794,43 @@ class CocBot:
                         base_treasure = self._scan_treasures()
                     except ScanFailed as e:
                         scan_streak += 1
-                        self._log(
-                            f"scan failed ({scan_streak}/{scan_limit}): {e}; "
-                            "backing out (retry_btn_1/2/3) and restarting"
+                        # Notify on every failure, attaching a screenshot of the
+                        # failing screen (captured here, before the recovery taps
+                        # below, so the image is not the post-recovery screen).
+                        self._notify(
+                            f"COC Auto-Farm: scan failed "
+                            f"({scan_streak}/{scan_limit})",
+                            f"{e}"
+                            + (" (stopping)" if scan_streak >= scan_limit else "")
+                            + (
+                                self._drain_average(raid_drains)
+                                if scan_streak >= scan_limit
+                                else ""
+                            ),
                         )
-                        self._press_button(self.config.RETRY_BTN_1)
-                        self._press_button(self.config.RETRY_BTN_2)
-                        self._press_button(self.config.RETRY_BTN_3)
+                        # The resource row is often hidden behind a dialog or a
+                        # lingering battle; on the very first resource-scan
+                        # failure, tap surr to back out and restart Phase 1.
+                        # From the second failure on, use the retry spots.
+                        if isinstance(e, TreasureScanFailed) and scan_streak == 1:
+                            self._log(
+                                f"resource scan failed ({scan_streak}/{scan_limit}): "
+                                f"{e}; tapping surr and restarting phase 1"
+                            )
+                            self._press_button(self.config.SURR_BTN)
+                        else:
+                            self._log(
+                                f"scan failed ({scan_streak}/{scan_limit}): {e}; "
+                                "backing out (retry_btn_1/2/3) and restarting"
+                            )
+                            self._press_button(self.config.RETRY_BTN_1)
+                            self._press_button(self.config.RETRY_BTN_2)
+                            self._press_button(self.config.RETRY_BTN_3)
                         if scan_streak >= scan_limit:
                             mins = (time.time() - st_time) // 60
                             self._alert(
                                 f"error: {e}, in {mins} min "
                                 f"(scan failed {scan_streak}x, stopping)"
-                            )
-                            self._notify(
-                                "COC Auto-Farm: scan failing",
-                                f"{e} — failed {scan_streak}x in a row; "
-                                f"stopping after {mins} min",
                             )
                             gave_up = True
                         search = False
@@ -532,7 +854,7 @@ class CocBot:
                         and current_elixir >= etarget
                     ):
                         # Attack
-                        self._initiate_attack(base)
+                        drained = self._initiate_attack(base)
 
                         self._press_button(self.config.SURR_BTN)
                         self._press_button(self.config.SURR_CONF)
@@ -551,7 +873,38 @@ class CocBot:
                         )
                         self._show_totals(totals)
 
+                        # Only count a raid once it has fully completed: the loot
+                        # read landed in totals. If the session errors during
+                        # surrender or the post-game read, this never runs, so the
+                        # error-time average covers only completed raids.
+                        if drained is not None:
+                            raid_drains.append(drained)
+
+                        # Watchdog: a raid that collected nothing at all usually
+                        # means the post-battle read failed (e.g. a missed
+                        # surrender) rather than a genuinely empty base, so a run
+                        # of them means the bot is desynced.
+                        if g_gain == 0 and e_gain == 0 and de_gain == 0:
+                            zero_loot_streak += 1
+                        else:
+                            zero_loot_streak = 0
+
                         self._press_button(self.config.RETURN_HOME)
+
+                        if zero_loot_streak >= scan_limit:
+                            mins = (time.time() - st_time) // 60
+                            self._alert(
+                                f"error: no loot read for {zero_loot_streak} raids "
+                                f"in a row, in {mins} min"
+                            )
+                            self._notify(
+                                "COC Auto-Farm: no loot read",
+                                f"{zero_loot_streak} raids in a row collected 0 "
+                                f"loot; stopping after {mins} min"
+                                + self._drain_average(raid_drains),
+                            )
+                            gave_up = True
+
                         search = False
                     else:
                         # Next base (calibrated button; low loot -> skip)
@@ -568,14 +921,21 @@ class CocBot:
                 self._log(f"error: {e}")
                 mins = (time.time() - st_time) // 60
                 self._alert(f"error: {e}, in {mins} min")
-                self._notify("COC Auto-Farm: error", f"{e} (after {mins} min)")
+                self._notify(
+                    "COC Auto-Farm: error",
+                    f"{e} (after {mins} min)" + self._drain_average(raid_drains),
+                )
             self._set_status("error")
         except Exception as e:
             self._log(f"error: {e}")
             mins = (time.time() - st_time) // 60
             self._alert(f"error: {e}, in {mins} min")
-            self._notify("COC Auto-Farm: error", f"{e} (after {mins} min)")
+            self._notify(
+                "COC Auto-Farm: error",
+                f"{e} (after {mins} min)" + self._drain_average(raid_drains),
+            )
             self._set_status("error")
         finally:
             self._set_status("stopped")
             self._show_totals(totals)
+            self._log(self._drain_summary(raid_drains))
